@@ -5,10 +5,11 @@
 int main() {
 	set_sys_clock_khz(200000, true);
 	stdio_init_all();
+        LT_I("BUILD %s %s", __DATE__, __TIME__);
 
 	pico506_t *pico = malloc(sizeof(*pico));
 	memset(pico, 0, sizeof(*pico));
-
+        
 	LT_D("Initializing SPI...");
 	pico->storage.sd.spi.sck_pin = PIN_SD_SCK;
 	pico->storage.sd.spi.tx_pin	 = PIN_SD_MOSI;

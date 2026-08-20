@@ -10,6 +10,7 @@
 #include "st506_wrdt.pio.h"
 #include "st506_wrgt.pio.h"
 #include "st506_wrrm.pio.h"
+#include "SEGGER_RTT.h"
 
 static pico506_t *g_pico = NULL;
 
@@ -26,7 +27,7 @@ int st506_start(pico506_t *pico) {
 		goto err;
 	// allocate memory for cylinder data
 	LT_V("Allocating cylinder data memory...");
-	pico->st506.cyl_data = malloc(malloc_len = CYLINDER_BYTES);
+	pico->st506.cyl_data = calloc(1, malloc_len = CYLINDER_BYTES + 256);
 	if (pico->st506.cyl_data == NULL)
 		goto err;
 	// allocate memory for write status
@@ -46,19 +47,27 @@ int st506_start(pico506_t *pico) {
 	gpio_put(PIN_SEEK_COMPLETE, true);
 	gpio_put(PIN_TRACK_0, true);
 	gpio_put(PIN_READY, true);
+	
+	gpio_init(3);
+	gpio_set_dir(3, GPIO_OUT);
+	gpio_put(3, 0);
 
 	pio_gpio_init(PIO_RDDT, PIN_READ);
 	pio_gpio_init(PIO_RDGT, PIN_INDEX);
-	pio_gpio_init(PIO_RDGT, PIN_SERVO_GATE);
+	gpio_set_inover(PIN_DIR_IN, GPIO_OVERRIDE_INVERT);
+        gpio_set_inover(PIN_HEAD_1, GPIO_OVERRIDE_INVERT);
+        gpio_set_inover(PIN_HEAD_2, GPIO_OVERRIDE_INVERT);
+        gpio_set_inover(PIN_WRITE_GATE, GPIO_OVERRIDE_INVERT);
 
 	// store pico506_t* for IRQ callback
 	g_pico = pico;
 	gpio_set_irq_enabled_with_callback(PIN_HEAD_1, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, st506_head_irq);
-
+        gpio_set_irq_enabled(PIN_HEAD_2, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
 	// load initial cylinder data
 	LT_V("Loading cylinder data...");
 	pico->st506.cyl = CYL_INVALID;
 	st506_on_seek(pico, /* cyl= */ 0);
+        
 
 	// load all PIO programs
 	LT_V("Loading PIO programs...");
@@ -79,6 +88,7 @@ int st506_start(pico506_t *pico) {
 		PIN_INDEX,
 		PIN_SERVO_GATE
 	);
+        LT_D("RDGT pulse[0]=%08lx pulse[1]=%08lx MARK_BITS=%d SECTOR_BITS=%d", pico->st506.pulse_data[0], pico->st506.pulse_data[1], MARK_BITS, SECTOR_BITS*SECTORS_PER_PULSE);
 
 	// initialize all PIO state machines
 	LT_V("Initializing PIO state machines...");
@@ -110,8 +120,10 @@ int st506_start(pico506_t *pico) {
 		1 + PULSES_PER_TRACK,
 		TRACK_WORDS
 	);
-
-	// start the WRGT PIO and DMA
+        for (int i = 0; i < 5; i++) {
+        LT_D("RDGT chan tc=%lu, RDDT chan tc=%lu", dma_hw->ch[st506_rdgt_chan].transfer_count, dma_hw->ch[st506_rddt_chan].transfer_count);
+        sleep_ms(4);
+        }
 	LT_V("Starting WRGT...");
 	st506_wrgt_program_start(
 		PIO_SM_WRGT,
@@ -144,6 +156,7 @@ void st506_stop(pico506_t *pico) {
 	LT_V("Disabling GPIO...");
 	g_pico = NULL;
 	gpio_set_irq_enabled_with_callback(PIN_HEAD_1, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false, NULL);
+	gpio_set_irq_enabled(PIN_HEAD_2, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
 	gpio_set_function(PIN_SERVO_GATE, GPIO_FUNC_NULL);
 	gpio_set_function(PIN_INDEX, GPIO_FUNC_NULL);
 	gpio_set_function(PIN_READ, GPIO_FUNC_NULL);
@@ -158,13 +171,7 @@ void st506_stop(pico506_t *pico) {
 }
 
 void st506_loop(pico506_t *pico) {
-	// check cylinder number received from STEP PIO
-	uint cyl_next = pico->st506.cyl_next;
-	if (cyl_next != CYL_INVALID) {
-		st506_on_seek(pico, cyl_next);
-	}
-
-	// check write address received from WRRM PIO
+        // check write address received from WRRM PIO
 	if (pio_sm_get_rx_fifo_level(PIO_SM_WRRMA)) {
 		uint end_addr	 = pio_sm_get(PIO_SM_WRRMA);
 		uint trans_count = pio_sm_get(PIO_SM_WRRMC);
@@ -177,6 +184,37 @@ void st506_loop(pico506_t *pico) {
 			st506_on_write(pico, trans_count, end_addr);
 		}
 	}
+
+	// check cylinder number received from STEP PIO
+	uint cyl_next = pico->st506.cyl_next;
+	if (cyl_next != CYL_INVALID) {
+	        gpio_put(PIN_SEEK_COMPLETE, false);
+	        // Realtime position signal, assert the moment the head reaches 0
+	        gpio_put(PIN_TRACK_0, cyl_next == 0);
+	        
+	        // latch target for the debounced (expensive) read
+		pico->st506.cyl_next     = CYL_INVALID;   // consume on sight
+		pico->st506.seek_target  = cyl_next;
+		pico->st506.seek_pending = true;
+		pico->st506.seek_time    = get_absolute_time();
+	}
+        if (pico->st506.seek_pending &&
+	    absolute_time_diff_us(pico->st506.seek_time, get_absolute_time()) > STEP_SETTLE_US) {
+		pico->st506.seek_pending = false;
+		pico->st506.needs_load = true;               // but don't read SD yet
+		gpio_put(PIN_TRACK_0, pico->st506.cyl == 0);
+		gpio_put(PIN_SEEK_COMPLETE, true);           // release the controller
+	}
+
+	// load only once stepping has actually stopped
+	if (pico->st506.needs_load &&
+	    absolute_time_diff_us(pico->st506.seek_time, get_absolute_time()) > 5000) {
+		pico->st506.needs_load = false;
+		// uint target = pico->st506.cyl;
+		// pico->st506.cyl = CYL_INVALID;
+		st506_on_seek(pico, pico->st506.seek_target);  // the existing storage_read + flush logic
+	}
+	
 
 	// check time elapsed since last activity
 	if (pico->st506.write_any &&
@@ -196,52 +234,52 @@ static void st506_head_irq(uint gpio, uint32_t event_mask) {
 	(void)gpio, (void)event_mask;
 	if (!g_pico)
 		return;
-	uint hd = gpio_get(PIN_HEAD_1);
+	uint hd = gpio_get(PIN_HEAD_1) | (gpio_get(PIN_HEAD_2) << 1);
 	st506_on_head(g_pico, hd);
 }
 
-void st506_on_write(pico506_t *pico, uint trans_count, uint end_addr) {
-	// calculate start/end position of this write
-	uint end_byte	 = end_addr - (uint)pico->st506.cyl_data;
-	uint start_byte	 = (end_byte - 1) - ((end_byte - 1) % TRACK_BYTES) + TRACK_BYTES - trans_count * sizeof(uint);
-	uint end_block	 = end_byte / 512;
-	uint start_block = start_byte / 512;
-
-	// mark blocks modified by this write
-	for (uint block = start_block; block <= end_block && block < CYLINDER_BLOCKS; block++) {
+void st506_on_write(pico506_t *pico, uint trans_count, uint end_addr) {	
+        (void)trans_count; (void)end_addr;
+        uint start_byte = pico->st506.hd * TRACK_BYTES;
+        uint end_byte   = start_byte + TRACK_BYTES;
+	uint start_block = start_byte /512;
+	uint end_block   = (end_byte + 511) / 512;
+	for (uint block = start_block; block <= end_block && block < CYLINDER_BLOCKS; block++)
 		pico->st506.write_block[block] = true;
-	}
 	pico->st506.write_any = true;
-
-	// store last activity time
 	pico->st506.last_activity = get_absolute_time();
-	// run the clicker on write
 	clicker_enqueue(CYL_INVALID);
 }
 
 void st506_on_head(pico506_t *pico, uint hd) {
-	if (hd == pico->st506.hd)
-		return;
+        LT_D("on_head: hd=%u  HSEL0=%u HSEL1=%u", hd, gpio_get(PIN_HEAD_1), gpio_get(PIN_HEAD_2));
 	if (hd >= HEADS)
 		hd = HEADS - 1;
-	pico->st506.hd		 = hd;
-	uint rddt_data_old	 = st506_rdgt_rddt_data;
-	uint rddt_data_new	 = (uint)pico->st506.cyl_data + hd * TRACK_BYTES;
-	uint rddt_cnt		 = st506_rdgt_rddt_cnt;
-	st506_rdgt_rddt_data = rddt_data_new;
-	st506_rddt_program_retarget(
-		st506_rdgt_ctrl_chan,
-		st506_rdgt_work_chan,
-		st506_rdgt_trig_chan,
-		rddt_data_old,
-		rddt_data_new,
-		rddt_cnt
-	);
+	bool changed = (hd != pico->st506.hd);
+	pico->st506.hd = hd;
 
-	// store last activity time
-	pico->st506.last_activity = get_absolute_time();
-	// run the clicker on head change
-	clicker_enqueue(CYL_INVALID);
+	// only retarget once the RDGT DMA channels exist (they're set up in
+	// st506_start AFTER the initial on_seek/on_head call). Guards the boot path.
+	if (st506_rdgt_ctrl_chan >= 0) {
+		uint rddt_data_old   = st506_rdgt_rddt_data;
+		uint rddt_data_new   = (uint)pico->st506.cyl_data + hd * TRACK_BYTES;
+		// in on_head, after computing rddt_data_new:
+		uint rddt_cnt        = st506_rdgt_rddt_cnt;
+		st506_rdgt_rddt_data = rddt_data_new;
+		st506_rddt_program_retarget(
+			st506_rdgt_ctrl_chan,
+			st506_rdgt_work_chan,
+			st506_rdgt_trig_chan,
+			rddt_data_old,
+			rddt_data_new,
+			rddt_cnt
+		);
+	}
+
+	if (changed) {
+		pico->st506.last_activity = get_absolute_time();
+		clicker_enqueue(CYL_INVALID);
+	}
 }
 
 void st506_on_seek(pico506_t *pico, uint cyl) {
@@ -250,8 +288,7 @@ void st506_on_seek(pico506_t *pico, uint cyl) {
 
 	// update GPIOs
 	gpio_put(PIN_SEEK_COMPLETE, false);
-	if (cyl != 0)
-		gpio_put(PIN_TRACK_0, false);
+	gpio_put(PIN_TRACK_0, cyl == 0);
 	pico->st506.cyl_next = CYL_INVALID;
 
 	if (pico->st506.cyl == CYL_INVALID) {
@@ -265,6 +302,13 @@ void st506_on_seek(pico506_t *pico, uint cyl) {
 			clicker_enqueue(pico->st506.cyl - cyl);
 	}
 
+
+        // dont flush while controller is still writing
+        absolute_time_t wg_deadline = make_timeout_time_ms(50);
+        while (gpio_get(PIN_WRITE_GATE) && !time_reached(wg_deadline))
+              tight_loop_contents();
+        sleep_us(300);
+        
 	if (pico->st506.write_any) {
 		// write data to storage if anything was modified
 		if (!pico->st506.write_all) {
@@ -287,7 +331,7 @@ void st506_on_seek(pico506_t *pico, uint cyl) {
 		uint write_bytes	  = st506_do_write(pico);
 		absolute_time_t end	  = get_absolute_time();
 
-		ulong micros = absolute_time_diff_us(start, end);
+		unsigned long micros = absolute_time_diff_us(start, end);
 		double speed = (double)write_bytes / ((double)micros / 1000000.0) / 1024.0;
 		LT_D(
 			"Write of cylinder %u (%u bytes) finished in %lu us -> %.03f KiB/s",
@@ -328,7 +372,7 @@ void st506_on_seek(pico506_t *pico, uint cyl) {
 	}
 	absolute_time_t end = get_absolute_time();
 
-	ulong micros = absolute_time_diff_us(start, end);
+	unsigned long micros = absolute_time_diff_us(start, end);
 	double speed = (double)read_bytes / ((double)micros / 1000000.0) / 1024.0;
 	LT_D(
 		"Read of cylinder %u (%u bytes) finished in %lu us -> %.03f KiB/s",
@@ -337,9 +381,15 @@ void st506_on_seek(pico506_t *pico, uint cyl) {
 		micros,
 		speed
 	);
-
-	// store last activity time
+        LT_D("RDGT pulse[0]=%08lx pulse[1]=%08lx MARK_BITS=%d SECTOR_BITS=%d", pico->st506.pulse_data[0], pico->st506.pulse_data[1], MARK_BITS, SECTOR_BITS*SECTORS_PER_PULSE);	
+        
+        // store last activity time
 	pico->st506.last_activity = get_absolute_time();
+
+	// re-establish the head pointer against the newly-loaded cylinder buffer.
+	// on_head() now retargets unconditionally, so this also covers the case
+	// where a write arrives before any head-select on the new cylinder.
+	st506_on_head(pico, pico->st506.hd < HEADS ? pico->st506.hd : 0);
 
 	// update GPIOs
 	if (cyl == 0)
@@ -347,11 +397,12 @@ void st506_on_seek(pico506_t *pico, uint cyl) {
 	gpio_put(PIN_SEEK_COMPLETE, true);
 }
 
+
 uint st506_do_write(pico506_t *pico) {
 	uint out_bytes = 0;
 	uint out_pos   = pico->st506.cyl * CYLINDER_BYTES;
 	int err		   = 0;
-
+	                  
 	if (pico->st506.write_all) {
 		// write the entire cylinder
 		out_bytes += CYLINDER_BYTES;
@@ -384,6 +435,8 @@ uint st506_do_write(pico506_t *pico) {
 				goto end;
 		}
 	}
+        // Flush buffer to SD
+	FRESULT fsr = f_sync(&pico->storage.fp);
 
 end:
 	memset(pico->st506.write_block, 0, CYLINDER_BLOCKS);

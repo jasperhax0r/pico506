@@ -40,6 +40,10 @@ typedef struct {
 		uint cyl;
 		uint hd;
 		volatile uint cyl_next;
+		uint seek_target;
+		bool seek_pending;
+		bool needs_load;
+		absolute_time_t seek_time;
 		bool write_any;
 		bool write_all;
 		bool *write_block;

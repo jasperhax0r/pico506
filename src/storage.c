@@ -14,7 +14,8 @@ int storage_init(pico506_t *pico) {
 	}
 	LT_I("Detected SD card '%s', %lu MiB", pico->storage.sd.name, pico->storage.sd.sectors / 2048);
 	disk_set_sd(&pico->storage.sd);
-
+        
+        spi_set_baudrate(pico->storage.sd.spi.inst, 8 * 1000 * 1000);
 	LT_D("Initializing FAT filesystem...");
 	if ((fs_err = f_mount(&pico->storage.fs, "", 1))) {
 		LT_E("Failed to mount FAT filesystem, fs_err = %u", fs_err);
@@ -27,7 +28,8 @@ int storage_init(pico506_t *pico) {
 						  : pico->storage.fs.fs_type == FS_EXFAT ? "exFAT"
 																 : "unknown";
 	char fs_label[13]	= {0};
-	ulong fs_sn			= 0;
+	// ulong fs_sn			= 0;
+	DWORD fs_sn		= 0;
 	f_getlabel("", fs_label, &fs_sn);
 	LT_I("Mounted %s volume '%s' with UUID %04lX-%04lX", fs_type, fs_label, fs_sn >> 16, fs_sn & 0xFFFF);
 
